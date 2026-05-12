@@ -8,9 +8,10 @@ venv/
 .venv/
 env/
 
-# IDE
+# IDE / local-only
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 
