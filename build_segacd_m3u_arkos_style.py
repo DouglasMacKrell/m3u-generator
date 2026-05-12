@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import errno
+import os
 import re
+import time
 from pathlib import Path
 from collections import defaultdict, Counter
 from typing import Optional, List, Dict, Tuple
@@ -163,6 +166,92 @@ def sort_discs(files: List[Path]) -> List[Path]:
     return sorted(files, key=key)
 
 
+def safe_m3u_stem_filename(stem: str) -> str:
+    """
+    If the stem contains path separators or NUL, pathlib would treat those as directories
+    and write_text raises FileNotFoundError (missing parent folder).
+    """
+    s = stem.replace("\0", "").replace("/", "_").replace("\\", "_").strip()
+    return s if s else "unnamed_playlist"
+
+
+def ensure_dir_writable(rom_dir: Path, *, skip_probe: bool) -> None:
+    """
+    Try to create a tiny file beside your ROMs. Network shares often fail this with
+    ETIMEDOUT (60 on macOS smbfs) during NAS sleep or flaky Wi‑Fi — that is unrelated
+    to whether the Finder path "looks writable".
+    """
+    if skip_probe:
+        return
+
+    # Avoid dotfiles: occasional SMB/sync stacks mishandle hidden names.
+    probe = rom_dir / "_m3u_generator_write_probe.tmp"
+
+    transient: set[int] = {
+        errno.ETIMEDOUT,
+        errno.EAGAIN,
+        errno.EBUSY,
+        errno.ENOENT,
+    }
+    if hasattr(errno, "ESTALE"):
+        transient.add(int(errno.ESTALE))
+
+    # pause[0]==0 → first attempt is immediate
+    pause_sec = [0.0, 0.75, 1.75, 3.25]
+    last_err: Optional[OSError] = None
+
+    for i, pause in enumerate(pause_sec):
+        if pause:
+            time.sleep(pause)
+        try:
+            probe.write_text("", encoding="utf-8")
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        except OSError as e:
+            last_err = e
+            errno_code = getattr(e, "errno", None)
+            if errno_code in transient and i < len(pause_sec) - 1:
+                continue
+            break
+
+    if last_err is None:
+        return
+
+    e = last_err
+    code = getattr(e, "errno", None)
+    errno_name = errno.errorcode.get(code, "?") if code is not None else "?"
+    strerror = os.strerror(code) if code is not None else str(e)
+
+    hint = ""
+    if code == errno.ETIMEDOUT:
+        hint = (
+            "\n\nLikely a network-volume timeout (SMB/AFP/NAS asleep, WLAN drop), not macOS folder "
+            'permissions.\nTips: wake the NAS/server, browse the folder once in Finder, use Ethernet, rerun.'
+        )
+    elif code == errno.ENOENT and str(rom_dir).startswith("/Volumes/"):
+        hint = (
+            "\n\nENOENT on a folder under /Volumes/ often reflects a stale SMB reconnect, "
+            'not literally "wrong path". Retry after confirming the share is reachable.'
+        )
+    else:
+        hint = (
+            "\n\nOtherwise: disk read-only / cloud placeholders / permission rules on exotic volumes."
+        )
+
+    raise SystemExit(
+        "ERROR: could not verify write access here (probe file).\n\n"
+        f"  Folder: {rom_dir.resolve()}\n"
+        f"  Errno {code} ({errno_name}): {strerror}"
+        "\n\n"
+        "(The script retries a few seconds for flaky shares.)"
+        f"{hint}\n\n"
+        "Bypass this check entirely with: --skip-write-probe"
+    ) from e
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Build .m3u files for multi-disc games (Knulli-safe naming)."
@@ -173,12 +262,21 @@ def main():
         default=".",
         help="Directory containing ROM files (default: current dir)",
     )
-    ap.add_argument("--force", action="store_true", help="Overwrite existing .m3u files")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing .m3u files (default is skip-if-exists so you can run after adding ROMs)",
+    )
     ap.add_argument(
         "--dry-run", action="store_true", help="Print what would be created without writing"
     )
+    ap.add_argument(
+        "--skip-write-probe",
+        action="store_true",
+        help="Skip optional write test before generating .m3u (SMB can time out probes even though writes work)",
+    )
 
-    # NEW: naming controls
+    # naming controls
     ap.add_argument(
         "--m3u-name-mode",
         choices=["disc-only", "smart", "aggressive"],
@@ -225,6 +323,12 @@ def main():
     if not images:
         print(f"No disc images found in {target_dir}. Nothing to do.")
         return
+
+    # Write playlists next to ROMs — use parent of scanned files so it matches listing.
+    rom_dir_for_output = images[0].parent
+
+    if not args.dry_run:
+        ensure_dir_writable(rom_dir_for_output, skip_probe=args.skip_write_probe)
 
     # Split into disc-tagged vs not (by filename)
     disc_tagged = [p for p in images if disc_number(p.stem) is not None]
@@ -287,31 +391,63 @@ def main():
         plan[m3u_stem] = [p]
 
     wrote = 0
-    skipped = 0
+    skipped_existing = 0
+    skipped_bad_path = 0
 
     for m3u_stem in sorted(plan.keys(), key=str.lower):
-        m3u_path = target_dir / f"{m3u_stem}.m3u"
+        file_stem = safe_m3u_stem_filename(m3u_stem)
+        if file_stem != m3u_stem:
+            print(f"Note: sanitized m3u filename (invalid path chars): {m3u_stem!r} -> {file_stem!r}")
 
-        if m3u_path.exists() and not args.force:
-            skipped += 1
+        m3u_path = rom_dir_for_output / f"{file_stem}.m3u"
+
+        # Preserve pre-existing playlists: skip without --force so runs only add missing .m3u files.
+        if not args.force and m3u_path.exists():
+            if not m3u_path.is_file():
+                print(
+                    f"WARNING: skipping {m3u_path.name!r}: something exists here that is "
+                    "not a regular file (folder or symlink). Fix or rename, then rerun."
+                )
+                skipped_bad_path += 1
+                continue
+            skipped_existing += 1
+            if args.dry_run:
+                lines = [p.name for p in plan[m3u_stem]]
+                print(f"[DRY-RUN] SKIP (already exists): {m3u_path.name} ({len(lines)} discs in plan)")
             continue
 
         lines = [p.name for p in plan[m3u_stem]]
         content = "\n".join(lines) + "\n"  # LF newline, filename-only
 
         if args.dry_run:
-            print(f"[DRY-RUN] {m3u_path.name}")
+            print(f"[DRY-RUN] WRITE {m3u_path.name}")
             for ln in lines:
                 print(f"  {ln}")
             print()
         else:
-            m3u_path.write_text(content, encoding="utf-8")
+            try:
+                m3u_path.write_text(content, encoding="utf-8")
+            except OSError as e:
+                raise SystemExit(
+                    f"ERROR: failed to write:\n  {m3u_path}\n{e}\n\n"
+                    "If the ROM folder is fine, another cause is path separators hiding in the "
+                    "display name — the script sanitizes slashes; rerun after updating."
+                ) from e
             wrote += 1
             print(f"Wrote: {m3u_path.name} ({len(lines)} entries)")
 
     print()
+    parts = [
+        f"Wrote {wrote} new .m3u file(s)",
+        f"left {skipped_existing} unchanged (.m3u already on disk)",
+    ]
+    if skipped_bad_path:
+        parts.append(f"skipped {skipped_bad_path} blocked path(s)")
     print(
-        f"Done. Wrote {wrote} m3u files. Skipped {skipped} existing (use --force to overwrite)."
+        f"Done. {', '.join(parts)}.",
+        "",  # separates next sentence for readability when terminal wraps long lines
+        "Use --force to overwrite every .m3u from this scan.",
+        sep="\n",
     )
 
 
